@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Terminal</title>
+
+  <!-- xterm.js from CDN -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      height: 100%;
+      background: #1a1a1a;
+      overflow: hidden;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    #header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 16px;
+      background: #2d2d2d;
+      border-bottom: 1px solid #404040;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+    }
+
+    #header .title {
+      font-weight: 600;
+    }
+
+    #header .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #header .status-indicator {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ff5f56;
+      transition: background 0.3s;
+    }
+
+    #header .status-indicator.connected {
+      background: #27c93f;
+    }
+
+    #header .status-indicator.connecting {
+      background: #ffbd2e;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    #terminal-container {
+      flex: 1;
+      padding: 4px;
+      background: #000;
+      overflow: hidden;
+    }
+
+    #terminal {
+      height: 100%;
+    }
+
+    /* Make xterm.js fill container */
+    .xterm {
+      height: 100%;
+    }
+
+    /* Overlay for connection status */
+    #overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.8);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 1000;
+      opacity: 1;
+      transition: opacity 0.3s;
+    }
+
+    #overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #overlay .message {
+      color: #fff;
+      font-family: monospace;
+      font-size: 16px;
+      text-align: center;
+    }
+
+    #overlay .message .spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid #fff;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-right: 10px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <span class="title">Web Terminal (tmux)</span>
+      <div class="status">
+        <span id="status-text">Disconnected</span>
+        <div id="status-indicator" class="status-indicator"></div>
+      </div>
+    </div>
+    <div id="terminal-container">
+      <div id="terminal"></div>
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div class="message">
+      <span class="spinner"></span>
+      <span id="overlay-text">Connecting...</span>
+    </div>
+  </div>
+
+  <!-- xterm.js and addons from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+
+  <script>
+    /**
+     * Web Terminal Client
+     *
+     * Connects to WebSocket server and relays bytes to/from xterm.js.
+     * - Binary frames for terminal I/O
+     * - JSON frames for control messages (init, resize)
+     */
+
+    (function() {
+      'use strict';
+
+      // =======================================================================
+      // Configuration
+      // =======================================================================
+
+      const CONFIG = {
+        // User ID - in production, get from auth system
+        userId: `user-${Math.random().toString(36).slice(2, 10)}`,
+
+        // Reconnection
+        reconnectDelayMs: 1000,
+        maxReconnectDelayMs: 30000,
+
+        // Terminal
+        fontSize: 14,
+        fontFamily: '"Cascadia Code", "Fira Code", "Menlo", "Monaco", monospace',
+      };
+
+      // Get userId from URL or localStorage for persistence
+      const urlParams = new URLSearchParams(window.location.search);
+      CONFIG.userId = urlParams.get('user') || localStorage.getItem('terminalUserId') || CONFIG.userId;
+      localStorage.setItem('terminalUserId', CONFIG.userId);
+
+      // =======================================================================
+      // State
+      // =======================================================================
+
+      let terminal = null;
+      let fitAddon = null;
+      let socket = null;
+      let reconnectDelay = CONFIG.reconnectDelayMs;
+      let reconnectTimer = null;
+      let isInitialized = false;
+
+      // UI elements
+      const statusIndicator = document.getElementById('status-indicator');
+      const statusText = document.getElementById('status-text');
+      const overlay = document.getElementById('overlay');
+      const overlayText = document.getElementById('overlay-text');
+
+      // =======================================================================
+      // Terminal Setup
+      // =======================================================================
+
+      function initTerminal() {
+        // Create terminal instance
+        terminal = new Terminal({
+          cursorBlink: true,
+          cursorStyle: 'block',
+          fontSize: CONFIG.fontSize,
+          fontFamily: CONFIG.fontFamily,
+          theme: {
+            background: '#000000',
+            foreground: '#e0e0e0',
+            cursor: '#ffffff',
+            cursorAccent: '#000000',
+            selection: 'rgba(255, 255, 255, 0.3)',
+            // Standard ANSI colors
+            black: '#000000',
+            red: '#e06c75',
+            green: '#98c379',
+            yellow: '#e5c07b',
+            blue: '#61afef',
+            magenta: '#c678dd',
+            cyan: '#56b6c2',
+            white: '#abb2bf',
+            brightBlack: '#5c6370',
+            brightRed: '#e06c75',
+            brightGreen: '#98c379',
+            brightYellow: '#e5c07b',
+            brightBlue: '#61afef',
+            brightMagenta: '#c678dd',
+            brightCyan: '#56b6c2',
+            brightWhite: '#ffffff',
+          },
+          // Critical for raw mode and binary data
+          allowProposedApi: true,
+          scrollback: 10000,
+          // Ensure alternate screen buffer works
+          convertEol: false,
+        });
+
+        // Load addons
+        fitAddon = new FitAddon.FitAddon();
+        terminal.loadAddon(fitAddon);
+
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+        terminal.loadAddon(webLinksAddon);
+
+        // Mount terminal
+        const container = document.getElementById('terminal');
+        terminal.open(container);
+
+        // Fit to container
+        setTimeout(() => {
+          fitAddon.fit();
+        }, 0);
+
+        // Handle terminal input → WebSocket
+        terminal.onData((data) => {
+          if (socket && socket.readyState === WebSocket.OPEN && isInitialized) {
+            // Send as binary (raw bytes)
+            const encoder = new TextEncoder();
+            socket.send(encoder.encode(data));
+          }
+        });
+
+        // Handle binary data (for things like file drag-drop, not commonly used)
+        terminal.onBinary((data) => {
+          if (socket && socket.readyState === WebSocket.OPEN && isInitialized) {
+            socket.send(new Uint8Array(data.split('').map(c => c.charCodeAt(0))));
+          }
+        });
+
+        // Handle resize
+        window.addEventListener('resize', handleResize);
+        terminal.onResize(({ cols, rows }) => {
+          sendResize(cols, rows);
+        });
+
+        console.log('Terminal initialized');
+      }
+
+      function handleResize() {
+        if (fitAddon && terminal) {
+          fitAddon.fit();
+        }
+      }
+
+      function sendResize(cols, rows) {
+        if (socket && socket.readyState === WebSocket.OPEN && isInitialized) {
+          socket.send(JSON.stringify({
+            type: 'resize',
+            cols: cols,
+            rows: rows,
+          }));
+        }
+      }
+
+      // =======================================================================
+      // WebSocket Connection
+      // =======================================================================
+
+      function connect() {
+        if (socket && socket.readyState === WebSocket.CONNECTING) {
+          return; // Already connecting
+        }
+
+        updateStatus('connecting', 'Connecting...');
+        overlayText.textContent = 'Connecting to server...';
+
+        // Determine WebSocket URL
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}`;
+
+        socket = new WebSocket(wsUrl);
+        socket.binaryType = 'arraybuffer'; // Critical: receive binary data as ArrayBuffer
+
+        socket.onopen = handleOpen;
+        socket.onmessage = handleMessage;
+        socket.onclose = handleClose;
+        socket.onerror = handleError;
+      }
+
+      function handleOpen() {
+        console.log('WebSocket connected');
+        reconnectDelay = CONFIG.reconnectDelayMs;
+
+        // Fit terminal and get dimensions
+        if (fitAddon) {
+          fitAddon.fit();
+        }
+
+        const cols = terminal.cols;
+        const rows = terminal.rows;
+
+        // Send init message
+        socket.send(JSON.stringify({
+          type: 'init',
+          userId: CONFIG.userId,
+          cols: cols,
+          rows: rows,
+        }));
+
+        overlayText.textContent = 'Initializing session...';
+      }
+
+      function handleMessage(event) {
+        if (event.data instanceof ArrayBuffer) {
+          // Binary frame: terminal output
+          const data = new Uint8Array(event.data);
+          const decoder = new TextDecoder();
+          terminal.write(decoder.decode(data));
+        } else {
+          // Text frame: control message
+          try {
+            const msg = JSON.parse(event.data);
+            handleControlMessage(msg);
+          } catch (e) {
+            console.error('Invalid control message:', e);
+          }
+        }
+      }
+
+      function handleControlMessage(msg) {
+        switch (msg.type) {
+          case 'init_ack':
+            console.log('Session initialized:', msg);
+            isInitialized = true;
+
+            updateStatus('connected', `Connected (${CONFIG.userId})`);
+            overlay.classList.add('hidden');
+
+            // Focus terminal
+            terminal.focus();
+
+            // Send current size (in case it changed during init)
+            sendResize(terminal.cols, terminal.rows);
+
+            // If this is a reconnect to existing session, terminal already has content
+            if (msg.sessionExists) {
+              console.log('Reattached to existing tmux session');
+            }
+            break;
+
+          case 'pong':
+            // Heartbeat response
+            break;
+
+          default:
+            console.log('Unknown control message:', msg);
+        }
+      }
+
+      function handleClose(event) {
+        console.log('WebSocket closed:', event.code, event.reason);
+        isInitialized = false;
+
+        updateStatus('disconnected', 'Disconnected');
+        overlay.classList.remove('hidden');
+
+        // Attempt reconnect
+        scheduleReconnect();
+      }
+
+      function handleError(error) {
+        console.error('WebSocket error:', error);
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+        }
+
+        overlayText.textContent = `Reconnecting in ${Math.round(reconnectDelay / 1000)}s...`;
+        updateStatus('connecting', 'Reconnecting...');
+
+        reconnectTimer = setTimeout(() => {
+          connect();
+        }, reconnectDelay);
+
+        // Exponential backoff
+        reconnectDelay = Math.min(reconnectDelay * 1.5, CONFIG.maxReconnectDelayMs);
+      }
+
+      // =======================================================================
+      // UI Helpers
+      // =======================================================================
+
+      function updateStatus(state, text) {
+        statusText.textContent = text;
+        statusIndicator.classList.remove('connected', 'connecting');
+
+        if (state === 'connected') {
+          statusIndicator.classList.add('connected');
+        } else if (state === 'connecting') {
+          statusIndicator.classList.add('connecting');
+        }
+      }
+
+      // =======================================================================
+      // Heartbeat
+      // =======================================================================
+
+      setInterval(() => {
+        if (socket && socket.readyState === WebSocket.OPEN && isInitialized) {
+          socket.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 30000);
+
+      // =======================================================================
+      // Initialize
+      // =======================================================================
+
+      document.addEventListener('DOMContentLoaded', () => {
+        initTerminal();
+        connect();
+
+        // Click on terminal to focus
+        document.getElementById('terminal-container').addEventListener('click', () => {
+          terminal.focus();
+        });
+
+        // Show user ID in console for debugging
+        console.log('User ID:', CONFIG.userId);
+        console.log('To use the same session, add ?user=' + CONFIG.userId + ' to the URL');
+      });
+
+    })();
+  </script>
+</body>
+</html>
