@@ -181,7 +181,7 @@ function handleWebSocket(ws, req) {
     }
 
     // After initialization
-    if (isBinary || Buffer.isBuffer(data)) {
+    if (isBinary) {
       // Binary frame = stdin to PTY
       if (session?.pty) {
         session.pty.write(data);
@@ -354,8 +354,9 @@ function handleHttpRequest(req, res) {
     return;
   }
 
-  // Serve static files
-  let filePath = req.url === '/' ? '/index.html' : req.url;
+  // Serve static files (strip query string)
+  const urlPath = req.url.split('?')[0];
+  let filePath = urlPath === '/' ? '/index.html' : urlPath;
   filePath = join(PUBLIC_DIR, filePath);
 
   // Security: prevent directory traversal
