@@ -45,10 +45,19 @@ const CONFIG = {
 // =============================================================================
 
 /**
- * Tracks active PTY connections (not tmux sessions).
+ * Tracks active WebSocket connections.
  * Map<connectionId, SessionInfo>
  */
 const activeSessions = new Map();
+
+/**
+ * Persistent PTY processes that survive WebSocket disconnects.
+ * Map<userId, { pty, cols, rows, createdAt, lastActivity, dataBuffer }>
+ */
+const persistentPtys = new Map();
+
+// How long to keep a PTY alive after disconnect (5 minutes)
+const PTY_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 let connectionIdCounter = 0;
 
@@ -93,14 +102,10 @@ function killTmuxSession(userId) {
 // =============================================================================
 
 /**
- * Create a PTY process for a user.
- *
- * Spawns an interactive shell directly (no tmux wrapper).
- * This allows users to manage their own tmux sessions from within
- * the web terminal without nesting issues.
+ * Create a new PTY process.
  */
-function createPtyForUser(userId, cols, rows) {
-  const ptyProcess = pty.spawn(CONFIG.defaultShell, [], {
+function createNewPty(cols, rows) {
+  return pty.spawn(CONFIG.defaultShell, [], {
     name: 'xterm-256color',
     cols: cols || CONFIG.defaultCols,
     rows: rows || CONFIG.defaultRows,
@@ -112,8 +117,98 @@ function createPtyForUser(userId, cols, rows) {
       TERM_PROGRAM: 'tmux-web',
     },
   });
+}
 
-  return ptyProcess;
+/**
+ * Get or create a persistent PTY for a user.
+ * Returns { pty, isNew, recentOutput }
+ */
+function getOrCreatePty(userId, cols, rows) {
+  const existing = persistentPtys.get(userId);
+
+  if (existing && existing.pty) {
+    // Clear any idle timeout
+    if (existing.idleTimeout) {
+      clearTimeout(existing.idleTimeout);
+      existing.idleTimeout = null;
+    }
+
+    // Resize if dimensions changed
+    if (existing.cols !== cols || existing.rows !== rows) {
+      existing.pty.resize(cols, rows);
+      existing.cols = cols;
+      existing.rows = rows;
+    }
+
+    existing.lastActivity = Date.now();
+
+    console.log(`[PTY] Reattaching to existing PTY for "${userId}"`);
+    return {
+      pty: existing.pty,
+      isNew: false,
+      recentOutput: existing.recentOutput || ''
+    };
+  }
+
+  // Create new PTY
+  const ptyProcess = createNewPty(cols, rows);
+
+  const ptyInfo = {
+    pty: ptyProcess,
+    cols,
+    rows,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    recentOutput: '',
+    idleTimeout: null,
+    wsConnection: null,
+  };
+
+  // Buffer recent output for reconnects (last 10KB)
+  ptyProcess.onData((data) => {
+    ptyInfo.lastActivity = Date.now();
+    ptyInfo.recentOutput += data;
+    // Keep only last 10KB
+    if (ptyInfo.recentOutput.length > 10240) {
+      ptyInfo.recentOutput = ptyInfo.recentOutput.slice(-10240);
+    }
+  });
+
+  // Handle PTY exit
+  ptyProcess.onExit(({ exitCode, signal }) => {
+    console.log(`[PTY] PTY for "${userId}" exited (code=${exitCode}, signal=${signal})`);
+    persistentPtys.delete(userId);
+  });
+
+  persistentPtys.set(userId, ptyInfo);
+
+  console.log(`[PTY] Created new PTY for "${userId}"`);
+  return { pty: ptyProcess, isNew: true, recentOutput: '' };
+}
+
+/**
+ * Mark a PTY as disconnected and start idle timeout.
+ */
+function detachPty(userId) {
+  const ptyInfo = persistentPtys.get(userId);
+  if (!ptyInfo) return;
+
+  ptyInfo.wsConnection = null;
+
+  // Start idle timeout to eventually kill the PTY
+  ptyInfo.idleTimeout = setTimeout(() => {
+    console.log(`[PTY] Killing idle PTY for "${userId}" after timeout`);
+    if (ptyInfo.pty) {
+      try {
+        ptyInfo.pty.kill();
+      } catch (e) {
+        // Ignore
+      }
+    }
+    persistentPtys.delete(userId);
+  }, PTY_IDLE_TIMEOUT_MS);
+
+  console.log(`[PTY] Detached PTY for "${userId}", will timeout in ${PTY_IDLE_TIMEOUT_MS / 1000}s`);
 }
 
 // =============================================================================
@@ -204,8 +299,9 @@ function handleWebSocket(ws, req) {
 
     console.log(`[${connectionId}] Initializing session for user "${userId}" (${safeCols}x${safeRows})`);
 
-    // Create PTY (plain shell - user can manage their own tmux sessions)
-    const ptyProcess = createPtyForUser(userId, safeCols, safeRows);
+    // Get or create persistent PTY
+    const { pty: ptyProcess, isNew, recentOutput } = getOrCreatePty(userId, safeCols, safeRows);
+    const ptyInfo = persistentPtys.get(userId);
 
     session = {
       connectionId,
@@ -219,25 +315,48 @@ function handleWebSocket(ws, req) {
     activeSessions.set(connectionId, session);
     initialized = true;
 
-    // PTY stdout → WebSocket (binary)
-    ptyProcess.onData((data) => {
+    // Store reference to WebSocket in PTY info
+    if (ptyInfo) {
+      ptyInfo.wsConnection = ws;
+    }
+
+    // Set up data forwarding from PTY to this WebSocket
+    const dataHandler = (data) => {
       if (ws.readyState === ws.OPEN) {
-        // Send as binary frame
         ws.send(Buffer.from(data), { binary: true });
       }
-    });
+    };
 
-    // PTY exit handler
-    ptyProcess.onExit(({ exitCode, signal }) => {
-      console.log(`[${connectionId}] PTY exited (code=${exitCode}, signal=${signal})`);
-      cleanup();
-      ws.close(1000, 'PTY exited');
-    });
+    // For new PTYs, onData is already set up in getOrCreatePty
+    // We need to add our WebSocket forwarding
+    if (isNew) {
+      ptyProcess.onData(dataHandler);
+    } else {
+      // For existing PTYs, we need to set up forwarding
+      // The onData in getOrCreatePty buffers output; we add another listener
+      ptyProcess.onData(dataHandler);
+
+      // Send recent output to restore terminal state
+      if (recentOutput) {
+        console.log(`[${connectionId}] Sending ${recentOutput.length} bytes of recent output`);
+        ws.send(Buffer.from(recentOutput), { binary: true });
+      }
+    }
+
+    // PTY exit handler - close WebSocket when PTY dies
+    if (isNew) {
+      ptyProcess.onExit(({ exitCode, signal }) => {
+        console.log(`[${connectionId}] PTY exited (code=${exitCode}, signal=${signal})`);
+        cleanup(false); // Don't detach, PTY is already dead
+        ws.close(1000, 'PTY exited');
+      });
+    }
 
     // Send acknowledgment
     ws.send(JSON.stringify({
       type: 'init_ack',
       connectionId,
+      sessionExists: !isNew,
       cols: safeCols,
       rows: safeRows,
     }));
@@ -261,19 +380,15 @@ function handleWebSocket(ws, req) {
   }
 
   // Cleanup on disconnect
-  function cleanup() {
+  function cleanup(shouldDetach = true) {
     if (idleTimer) clearTimeout(idleTimer);
 
     if (session) {
       console.log(`[${connectionId}] Cleaning up session for "${session.userId}"`);
 
-      // Kill PTY (but NOT tmux session)
-      if (session.pty) {
-        try {
-          session.pty.kill();
-        } catch (e) {
-          // Ignore - PTY may already be dead
-        }
+      // Detach PTY (keep it alive for reconnects) instead of killing
+      if (shouldDetach && session.userId) {
+        detachPty(session.userId);
       }
 
       activeSessions.delete(connectionId);
@@ -283,7 +398,7 @@ function handleWebSocket(ws, req) {
 
   ws.on('close', (code, reason) => {
     console.log(`[${connectionId}] WebSocket closed (code=${code}, reason=${reason})`);
-    cleanup();
+    cleanup(true); // Detach PTY, keep it alive
   });
 
   ws.on('error', (err) => {
@@ -311,7 +426,8 @@ function handleHttpRequest(req, res) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
-      activeSessions: activeSessions.size,
+      activeConnections: activeSessions.size,
+      persistentPtys: persistentPtys.size,
       tmuxSessions: listTmuxSessions().length,
     }));
     return;
