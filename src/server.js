@@ -1,10 +1,10 @@
 /**
- * Web Terminal Server with tmux Support
+ * Web Terminal Server
  *
  * Architecture:
  * - WebSocket server accepts connections
- * - Each connection gets a PTY running "tmux attach || tmux new"
- * - PTY is ephemeral; tmux session persists across reconnects
+ * - Each connection gets a PTY running an interactive shell
+ * - Users can manage their own tmux sessions from within the terminal
  * - Binary WebSocket frames for terminal I/O
  * - JSON messages for control (resize)
  */
@@ -35,12 +35,9 @@ const CONFIG = {
   defaultShell: process.env.SHELL || '/bin/bash',
 
   // Limits
-  maxSessionsPerUser: 1,        // One tmux session per user
+  maxSessionsPerUser: 1,        // One PTY per user
   maxTotalSessions: 100,        // Max concurrent PTY connections
-  idleTimeoutMs: 30 * 60 * 1000, // 30 minutes idle timeout for PTY (not tmux)
-
-  // tmux configuration
-  tmuxSocketDir: process.env.TMUX_SOCKET_DIR || '/tmp/tmux-web',
+  idleTimeoutMs: 30 * 60 * 1000, // 30 minutes idle timeout for PTY
 };
 
 // =============================================================================
@@ -96,24 +93,14 @@ function killTmuxSession(userId) {
 // =============================================================================
 
 /**
- * Create a PTY that attaches to (or creates) a tmux session.
+ * Create a PTY process for a user.
  *
- * Key insight: The PTY runs "tmux attach || tmux new".
- * - If tmux session exists: attach to it
- * - If not: create new session
- *
- * When PTY dies (disconnect), tmux session survives.
+ * Spawns an interactive shell directly (no tmux wrapper).
+ * This allows users to manage their own tmux sessions from within
+ * the web terminal without nesting issues.
  */
 function createPtyForUser(userId, cols, rows) {
-  // Sanitize userId to prevent command injection
-  const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '_');
-
-  // tmux command: attach if exists, otherwise create new session
-  // -A flag: attach to session if exists, create if not (tmux 1.8+)
-  // We use explicit attach || new for better control and compatibility
-  const tmuxCmd = `tmux attach-session -t "${safeUserId}" 2>/dev/null || tmux new-session -s "${safeUserId}"`;
-
-  const ptyProcess = pty.spawn(CONFIG.defaultShell, ['-c', tmuxCmd], {
+  const ptyProcess = pty.spawn(CONFIG.defaultShell, [], {
     name: 'xterm-256color',
     cols: cols || CONFIG.defaultCols,
     rows: rows || CONFIG.defaultRows,
@@ -122,7 +109,6 @@ function createPtyForUser(userId, cols, rows) {
       ...process.env,
       TERM: 'xterm-256color',
       COLORTERM: 'truecolor',
-      // Ensure tmux knows it's in a capable terminal
       TERM_PROGRAM: 'tmux-web',
     },
   });
@@ -218,11 +204,7 @@ function handleWebSocket(ws, req) {
 
     console.log(`[${connectionId}] Initializing session for user "${userId}" (${safeCols}x${safeRows})`);
 
-    // Check if tmux session already exists
-    const sessionExists = tmuxSessionExists(userId);
-    console.log(`[${connectionId}] tmux session "${userId}" exists: ${sessionExists}`);
-
-    // Create PTY
+    // Create PTY (plain shell - user can manage their own tmux sessions)
     const ptyProcess = createPtyForUser(userId, safeCols, safeRows);
 
     session = {
@@ -248,8 +230,6 @@ function handleWebSocket(ws, req) {
     // PTY exit handler
     ptyProcess.onExit(({ exitCode, signal }) => {
       console.log(`[${connectionId}] PTY exited (code=${exitCode}, signal=${signal})`);
-      // Don't close WebSocket immediately - let client decide to reconnect
-      // The tmux session may still be alive
       cleanup();
       ws.close(1000, 'PTY exited');
     });
@@ -258,7 +238,6 @@ function handleWebSocket(ws, req) {
     ws.send(JSON.stringify({
       type: 'init_ack',
       connectionId,
-      sessionExists,
       cols: safeCols,
       rows: safeRows,
     }));
@@ -438,15 +417,15 @@ function main() {
   httpServer.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║              tmux Web Terminal Server Started                  ║
+║                  Web Terminal Server Started                   ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  URL:     http://${CONFIG.host}:${CONFIG.port.toString().padEnd(43)}║
 ║  Health:  http://${CONFIG.host}:${CONFIG.port}/health${' '.repeat(35)}║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Features:                                                     ║
-║  • Real PTY with tmux session persistence                      ║
+║  • Real PTY with interactive shell                             ║
 ║  • Binary WebSocket frames for raw terminal I/O                ║
-║  • Reconnect support (tmux survives disconnects)               ║
+║  • User-managed tmux sessions supported                        ║
 ║  • Terminal resize support                                     ║
 ╚════════════════════════════════════════════════════════════════╝
     `);
